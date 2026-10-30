@@ -1,4 +1,4 @@
-name: Build One TV APK
+name: Build One TV Release
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
           mkdir -p onetv-project
           unzip -q "$ZIP_FILE" -d onetv-project
 
-          echo "Extracted project:"
+          echo "Extracted files:"
           find onetv-project -maxdepth 3 -type f | sort
 
       - name: Detect Android project root
@@ -66,33 +66,105 @@ jobs:
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Verify Android environment
-        run: |
-          java -version
-          sdkmanager --version
-          adb version
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: "8.13"
 
-      - name: Build One TV Debug APK
+      - name: Prepare release keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ONETV_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "ERROR: ONETV_KEYSTORE_BASE64 secret is missing."
+            exit 1
+          fi
+
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/OneTV-release.keystore"
+
+          test -s "$RUNNER_TEMP/OneTV-release.keystore"
+
+          echo "Release keystore prepared."
+
+      - name: Build unsigned Release APK and AAB
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          gradle --no-daemon :app:assembleDebug --stacktrace
+          gradle --no-daemon :app:assembleRelease :app:bundleRelease --stacktrace
 
-      - name: Find APK
+      - name: Find Release outputs
         run: |
-          echo "APK files:"
+          echo "Release APK:"
           find "$PROJECT_DIR/app/build/outputs/apk" \
             -type f \
             -name "*.apk" \
             -print
 
-      - name: Upload One TV APK
+          echo "Release AAB:"
+          find "$PROJECT_DIR/app/build/outputs/bundle" \
+            -type f \
+            -name "*.aab" \
+            -print
+
+      - name: Sign Release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ONETV_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ONETV_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ONETV_KEY_PASSWORD }}
+        run: |
+          APK_FILE=$(find "$PROJECT_DIR/app/build/outputs/apk/release" \
+            -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK_FILE" ]; then
+            echo "ERROR: Release APK not found."
+            exit 1
+          fi
+
+          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+
+          "$BUILD_TOOLS/zipalign" -p -f 4 \
+            "$APK_FILE" \
+            "$RUNNER_TEMP/OneTV-aligned.apk"
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$RUNNER_TEMP/OneTV-release.keystore" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "$RUNNER_TEMP/OneTV-release.apk" \
+            "$RUNNER_TEMP/OneTV-aligned.apk"
+
+          "$BUILD_TOOLS/apksigner" verify \
+            --verbose \
+            "$RUNNER_TEMP/OneTV-release.apk"
+
+      - name: Sign Release AAB
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ONETV_KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ONETV_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ONETV_KEY_ALIAS }}
+        run: |
+          AAB_FILE=$(find "$PROJECT_DIR/app/build/outputs/bundle/release" \
+            -type f -name "*.aab" | head -n 1)
+
+          if [ -z "$AAB_FILE" ]; then
+            echo "ERROR: Release AAB not found."
+            exit 1
+          fi
+
+          jarsigner \
+            -keystore "$RUNNER_TEMP/OneTV-release.keystore" \
+            -storepass "$KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            "$AAB_FILE" \
+            "$KEY_ALIAS"
+
+          cp "$AAB_FILE" "$RUNNER_TEMP/OneTV-release.aab"
+
+      - name: Upload One TV Release files
         uses: actions/upload-artifact@v4
         with:
-          name: OneTV-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          name: OneTV-release
+          path: |
+            ${{ runner.temp }}/OneTV-release.apk
+            ${{ runner.temp }}/OneTV-release.aab
           if-no-files-found: error
