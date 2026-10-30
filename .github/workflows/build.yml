@@ -14,28 +14,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Check ZIP file
+      - name: Find One TV ZIP
         run: |
-          ls -lh
-          test -f OneTV-FRESH.zip
+          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository root."
+            exit 1
+          fi
+
+          echo "Found ZIP: $ZIP_FILE"
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
       - name: Extract One TV project
         run: |
           rm -rf onetv-project
-          mkdir onetv-project
-          unzip -q OneTV-FRESH.zip -d onetv-project
-          echo "Extracted files:"
+          mkdir -p onetv-project
+          unzip -q "$ZIP_FILE" -d onetv-project
+
+          echo "Extracted project:"
           find onetv-project -maxdepth 3 -type f | sort
 
       - name: Detect Android project root
         run: |
-          PROJECT_DIR=$(find onetv-project -name settings.gradle.kts -o -name settings.gradle | head -n 1 | xargs -r dirname)
+          PROJECT_DIR=$(find onetv-project \
+            \( -name settings.gradle.kts -o -name settings.gradle \) \
+            -print -quit | xargs -r dirname)
+
           if [ -z "$PROJECT_DIR" ]; then
             echo "ERROR: Android project root not found."
             exit 1
           fi
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
           echo "Android project root: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v6
@@ -73,7 +85,10 @@ jobs:
       - name: Find APK
         run: |
           echo "APK files:"
-          find "$PROJECT_DIR/app/build/outputs/apk" -type f -name "*.apk" -print
+          find "$PROJECT_DIR/app/build/outputs/apk" \
+            -type f \
+            -name "*.apk" \
+            -print
 
       - name: Upload One TV APK
         uses: actions/upload-artifact@v4
