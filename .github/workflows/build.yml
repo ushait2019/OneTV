@@ -86,7 +86,7 @@ jobs:
 
           echo "Release keystore prepared."
 
-      - name: Build unsigned Release APK and AAB
+      - name: Build Release APK and AAB
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           gradle --no-daemon :app:assembleRelease :app:bundleRelease --stacktrace
