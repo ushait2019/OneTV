@@ -1,170 +1,118 @@
-name: Build One TV Release
+name: OneTV Android Debug APK (Autodetect Source)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main, master, dev-live]
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build-debug:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      - name: Find One TV ZIP
+      - name: Locate OneTV Android project (root, nested, or ZIP)
+        id: locate
+        shell: bash
         run: |
-          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found in repository root."
+          set -Eeuo pipefail
+          is_project() {
+            local dir="$1"
+            [[ -f "$dir/settings.gradle.kts" || -f "$dir/settings.gradle" ]] &&
+            [[ -f "$dir/app/build.gradle.kts" || -f "$dir/app/build.gradle" ]]
+          }
+          locate_project() {
+            local base="$1" settings candidate
+            if is_project "$base"; then
+              PROJECT_DIR="$base"
+              return 0
+            fi
+            while IFS= read -r -d '' settings; do
+              candidate="$(dirname "$settings")"
+              if is_project "$candidate"; then
+                PROJECT_DIR="$candidate"
+                return 0
+              fi
+            done < <(find "$base" -maxdepth 8 -type f           \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -print0)
+            return 1
+          }
+          
+          PROJECT_DIR=""
+          if ! locate_project "$GITHUB_WORKSPACE"; then
+            echo 'No expanded Android project found; checking uploaded ZIP archives...'
+            archive_index=0
+            while IFS= read -r -d '' archive; do
+              archive_index=$((archive_index + 1))
+              target="$RUNNER_TEMP/onetv-android-source-$archive_index"
+              mkdir -p "$target"
+              echo "Inspecting archive: ${archive#"$GITHUB_WORKSPACE"/}"
+              if unzip -qq "$archive" -d "$target"; then
+                if locate_project "$target"; then break; fi
+              else
+                echo "Skipping invalid ZIP archive: $archive" >&2
+              fi
+            done < <(find "$GITHUB_WORKSPACE" -maxdepth 6 -type f -iname '*.zip' -print0)
+          fi
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo 'ERROR: Android project root not found.' >&2
+            echo 'Expected settings.gradle.kts + app/build.gradle.kts together.' >&2
+            echo 'Upload/extract the OneTV Android Studio SOURCE ZIP, not the backend JS ZIP.' >&2
+            echo 'Repository top-level files:' >&2
+            ls -la "$GITHUB_WORKSPACE" | head -50
             exit 1
           fi
-
-          echo "Found ZIP: $ZIP_FILE"
-          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
-
-      - name: Extract One TV project
-        run: |
-          rm -rf onetv-project
-          mkdir -p onetv-project
-          unzip -q "$ZIP_FILE" -d onetv-project
-
-          echo "Extracted files:"
-          find onetv-project -maxdepth 3 -type f | sort
-
-      - name: Detect Android project root
-        run: |
-          PROJECT_DIR=$(find onetv-project \
-            \( -name settings.gradle.kts -o -name settings.gradle \) \
-            -print -quit | xargs -r dirname)
-
-          if [ -z "$PROJECT_DIR" ]; then
-            echo "ERROR: Android project root not found."
-            exit 1
-          fi
-
-          echo "Android project root: $PROJECT_DIR"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v6
+          echo "Found OneTV Android project at: $PROJECT_DIR"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "### OneTV Android source" >> "$GITHUB_STEP_SUMMARY"
+          echo "Found project: \`$PROJECT_DIR\`" >> "$GITHUB_STEP_SUMMARY"
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK 35
+        shell: bash
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Verify Gradle project
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
+          set -Eeuo pipefail
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+          test -f app/src/main/AndroidManifest.xml
+          test -f gradle/wrapper/gradle-wrapper.jar
+          chmod +x gradlew
+          ./gradlew --version
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: "8.13"
-
-      - name: Prepare release keystore
+      - name: Build OneTV Debug APK
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
         env:
-          KEYSTORE_BASE64: ${{ secrets.ONETV_KEYSTORE_BASE64 }}
+          ONETV_BACKEND_URL: ${{ secrets.ONETV_BACKEND_URL }}
         run: |
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "ERROR: ONETV_KEYSTORE_BASE64 secret is missing."
-            exit 1
-          fi
+          set -Eeuo pipefail
+          ./gradlew --no-daemon --stacktrace \
+            -PbackendUrl="$ONETV_BACKEND_URL" \
+            :app:assembleDebug
 
-          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/OneTV-release.keystore"
-
-          test -s "$RUNNER_TEMP/OneTV-release.keystore"
-
-          echo "Release keystore prepared."
-
-      - name: Build Release APK and AAB
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          gradle --no-daemon :app:assembleRelease :app:bundleRelease --stacktrace
-
-      - name: Find Release outputs
-        run: |
-          echo "Release APK:"
-          find "$PROJECT_DIR/app/build/outputs/apk" \
-            -type f \
-            -name "*.apk" \
-            -print
-
-          echo "Release AAB:"
-          find "$PROJECT_DIR/app/build/outputs/bundle" \
-            -type f \
-            -name "*.aab" \
-            -print
-
-      - name: Sign Release APK
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.ONETV_KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ONETV_KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.ONETV_KEY_PASSWORD }}
-        run: |
-          APK_FILE=$(find "$PROJECT_DIR/app/build/outputs/apk/release" \
-            -type f -name "*.apk" | head -n 1)
-
-          if [ -z "$APK_FILE" ]; then
-            echo "ERROR: Release APK not found."
-            exit 1
-          fi
-
-          BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/36.0.0"
-
-          "$BUILD_TOOLS/zipalign" -p -f 4 \
-            "$APK_FILE" \
-            "$RUNNER_TEMP/OneTV-aligned.apk"
-
-          "$BUILD_TOOLS/apksigner" sign \
-            --ks "$RUNNER_TEMP/OneTV-release.keystore" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass env:KEYSTORE_PASSWORD \
-            --key-pass env:KEY_PASSWORD \
-            --out "$RUNNER_TEMP/OneTV-release.apk" \
-            "$RUNNER_TEMP/OneTV-aligned.apk"
-
-          "$BUILD_TOOLS/apksigner" verify \
-            --verbose \
-            "$RUNNER_TEMP/OneTV-release.apk"
-
-      - name: Sign Release AAB
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.ONETV_KEYSTORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.ONETV_KEY_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.ONETV_KEY_ALIAS }}
-        run: |
-          AAB_FILE=$(find "$PROJECT_DIR/app/build/outputs/bundle/release" \
-            -type f -name "*.aab" | head -n 1)
-
-          if [ -z "$AAB_FILE" ]; then
-            echo "ERROR: Release AAB not found."
-            exit 1
-          fi
-
-          jarsigner \
-            -keystore "$RUNNER_TEMP/OneTV-release.keystore" \
-            -storepass "$KEYSTORE_PASSWORD" \
-            -keypass "$KEY_PASSWORD" \
-            "$AAB_FILE" \
-            "$KEY_ALIAS"
-
-          cp "$AAB_FILE" "$RUNNER_TEMP/OneTV-release.aab"
-
-      - name: Upload One TV Release files
+      - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: OneTV-release
-          path: |
-            ${{ runner.temp }}/OneTV-release.apk
-            ${{ runner.temp }}/OneTV-release.aab
+          name: OneTV-Debug-${{ github.run_number }}
+          path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+          retention-days: 14
